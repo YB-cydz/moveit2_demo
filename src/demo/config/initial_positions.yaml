@@ -1,0 +1,9 @@
+# Default initial positions for tianyi2_complete's ros2_control fake system
+
+initial_positions:
+  elbow_pitch_l_joint: 0
+  elbow_yaw_l_joint: 0
+  shoulder_roll_l_joint: 0
+  shoulder_yaw_l_joint: 0
+  wrist_pitch_l_joint: 0
+  wrist_roll_l_joint: 0
