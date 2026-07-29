@@ -118,14 +118,17 @@ class MoveIt2Client:
         srv_req = GetMotionPlan.Request()
         srv_req.motion_plan_request = req
 
+        self._logger.info("Calling /plan_kinematic_path ...")
         future = self._plan_client.call_async(srv_req)
-        result = self._wait_for_future(future, timeout=PLANNING_TIME + 3.0)
+        rclpy.spin_until_future_complete(
+            self._node, future, timeout_sec=PLANNING_TIME + 3.0
+        )
 
-        if result is None:
+        if future.result() is None:
             self._logger.error("Plan service call timed out")
             return None
 
-        resp = result.motion_plan_response
+        resp = future.result().motion_plan_response
         if resp.error_code.val != 1:
             self._logger.error(f"Plan failed: error_code={resp.error_code.val}")
             return None
@@ -140,26 +143,6 @@ class MoveIt2Client:
         return traj
 
     # -------------------------------------------------------------------------
-    # Future 等待工具（线程安全，不阻塞 executor）
-    # -------------------------------------------------------------------------
-    def _wait_for_future(self, future, timeout):
-        """用 threading.Event 等待 future 完成，不阻塞 rclpy executor"""
-        event = threading.Event()
-        result_holder = [None]
-
-        def done_callback(fut):
-            result_holder[0] = fut.result()
-            event.set()
-
-        future.add_done_callback(done_callback)
-
-        if not event.wait(timeout=timeout):
-            self._logger.error("Future timed out")
-            return None
-
-        return result_holder[0]
-
-    # -------------------------------------------------------------------------
     # 执行轨迹
     # -------------------------------------------------------------------------
     def execute(self, trajectory):
@@ -169,16 +152,22 @@ class MoveIt2Client:
 
         self._logger.info("Sending execute goal...")
         send_future = self._exec_client.send_goal_async(goal_msg)
-        goal_handle = self._wait_for_future(send_future, timeout=5.0)
+        rclpy.spin_until_future_complete(self._node, send_future, timeout_sec=5.0)
 
-        if goal_handle is None or not goal_handle.accepted:
-            self._logger.error("Execute rejected or timed out")
+        if send_future.result() is None:
+            self._logger.error("Execute send timed out")
+            return False
+
+        goal_handle = send_future.result()
+        if not goal_handle.accepted:
+            self._logger.error("Execute rejected")
             return False
 
         self._logger.info("Executing...")
         result_future = goal_handle.get_result_async()
-        result = self._wait_for_future(result_future, timeout=30.0)
+        rclpy.spin_until_future_complete(self._node, result_future, timeout_sec=30.0)
 
+        result = result_future.result()
         if result is None:
             self._logger.error("Execute result timed out")
             return False
@@ -248,11 +237,18 @@ class PoseGoalNode(Node):
             f"Target: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}"
         )
 
-        traj = self._client.plan_pose(
-            x=pos.x, y=pos.y, z=pos.z,
-            qw=ori.w, qx=ori.x, qy=ori.y, qz=ori.z,
+        # 在后台线程中执行规划+执行，不阻塞 executor
+        thread = threading.Thread(
+            target=self._do_plan_and_execute,
+            args=(pos.x, pos.y, pos.z,
+                  ori.w, ori.x, ori.y, ori.z),
+            daemon=True,
         )
+        thread.start()
 
+    def _do_plan_and_execute(self, x, y, z, qw, qx, qy, qz):
+        """在独立线程中调用 service/action，rclpy 内部自行创建 executor"""
+        traj = self._client.plan_pose(x=x, y=y, z=z, qw=qw, qx=qx, qy=qy, qz=qz)
         if traj:
             self._client.execute(traj)
 
@@ -260,9 +256,7 @@ class PoseGoalNode(Node):
 def main():
     rclpy.init()
     node = PoseGoalNode()
-    executor = rclpy.executors.MultiThreadedExecutor(2)
-    executor.add_node(node)
-    executor.spin()
+    rclpy.spin(node)
     rclpy.shutdown()
 
 

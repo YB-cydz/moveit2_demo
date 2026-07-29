@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **重要规则**：执行任何命令行操作（`ros2`、`colcon`、`git`、`apt` 等）前，必须先说明意图并得到用户明确许可。
+
 ## 项目概述
 
 天轶2.0（Tianyi 2.0）双足双臂人形机器人的 ROS 2 + MoveIt 2 运动规划工作空间。包含两个包：
