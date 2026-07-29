@@ -4,13 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-天轶2.0（Tianyi 2.0）双足双臂人形机器人的 ROS 2 + MoveIt 2 运动规划工作空间。包含三个包：
+天轶2.0（Tianyi 2.0）双足双臂人形机器人的 ROS 2 + MoveIt 2 运动规划工作空间。包含两个包：
 
 | 包 | 类型 | 说明 |
 |---|---|---|
 | `tianyi2_urdf` | 自研 | 机器人 URDF 模型、STL 网格（原始 + 凸包）、RViz 可视化 launch |
 | `demo` | MoveIt 生成 | MoveIt Setup Assistant 生成的配置包（SRDF/运动学/控制器） |
-| `pymoveit2` | 第三方 | Python 版 MoveIt 2 接口库（AndrejOrsula/pymoveit2） |
+
+MoveIt 2 通过 apt 安装（`ros-humble-moveit*`），无需源码编译。
 
 ## 构建与运行
 
@@ -89,86 +90,53 @@ shoulder_pitch_l_link → shoulder_roll_l_link → shoulder_yaw_l_link
 ### 网格
 
 - `tianyi2_urdf/meshes/` — 原始 STL，用于**可视化**
-- `tianyi2_urdf/meshes_convex/` — 由 `prime_to_convex.py` 生成的凸包 STL，用于**碰撞检测**
+- `tianyi2_urdf/meshes_convex/` — 凸包 STL，用于**碰撞检测**
 
 ---
 
-## pymoveit2 API（Python 开发核心）
+## Python 运动控制
 
-所有 Python 运动控制代码应使用 `pymoveit2.MoveIt2` 类。
+控制节点通过 ROS 2 action/service 与 `move_group` 节点通信。核心流程：
 
-### 两种使用模式
-
-**模式 1：分离 Plan + Execute**（默认，`use_move_group_action=False`）
-```python
-trajectory = moveit2.plan(position=[0.3, 0.0, 0.5], quat_xyzw=[0.0, 0.0, 0.0, 1.0])
-moveit2.execute(trajectory)
-moveit2.wait_until_executed()
+```
+你的 Python 节点
+  → set_pose_target / set_joint_value_target（move_group service）
+  → plan() → JointTrajectory
+  → execute() → FollowJointTrajectory action → ros2_control → 硬件
 ```
 
-**模式 2：合并 Plan + Execute**（`use_move_group_action=True`）
+### 人形机器人参数（编写控制节点时使用）
+
 ```python
-moveit2.move_to_pose(position=[0.3, 0.0, 0.5], quat_xyzw=[0.0, 0.0, 0.0, 1.0])
-moveit2.wait_until_executed()
+# 左臂 joint_names（来自 SRDF chain 定义）
+JOINT_NAMES = [
+    "shoulder_roll_l_joint", "shoulder_yaw_l_joint",
+    "elbow_pitch_l_joint",   "elbow_yaw_l_joint",
+    "wrist_pitch_l_joint",   "wrist_roll_l_joint",
+]
+
+# 关键 frame
+BASE_LINK = "base"                    # 或 "shoulder_pitch_l_link"
+END_EFFECTOR = "L_base_link"          # 左臂末端
+GROUP_NAME = "hand_L_Arn_Group"       # SRDF 中的规划组名
+HOME_POSE = "home"                    # SRDF 中预设的 group_state
 ```
 
-### 关键 API 方法
+### 创建新的控制包
 
-| 方法 | 说明 |
-|---|---|
-| `plan(position=, quat_xyzw=)` | 运动学路径规划（位姿目标） |
-| `plan(joint_positions=)` | 运动学路径规划（关节目标） |
-| `plan(cartesian=True)` | 笛卡尔空间路径规划 |
-| `plan_async(...)` | 异步规划，返回 Future |
-| `execute(trajectory)` | 执行已规划的轨迹 |
-| `move_to_pose(...)` | 规划 + 执行（位姿目标） |
-| `move_to_configuration(...)` | 规划 + 执行（关节目标） |
-| `compute_fk(joint_state=)` | 正运动学 |
-| `compute_ik(position=, quat_xyzw=)` | 逆运动学 |
-| `add_collision_box/sphere/cylinder/cone/mesh(...)` | 添加碰撞对象 |
-| `attach_collision_object(id, link_name)` | 附加碰撞对象到机器人 |
-| `remove_collision_object(id)` | 移除碰撞对象 |
-| `query_state()` | 查询当前执行状态（IDLE/REQUESTING/EXECUTING） |
-
-### 关键属性
-
-- `max_velocity` / `max_acceleration` — 速度/加速度缩放因子（0.0~1.0）
-- `planner_id` — 规划器选择（如 `"RRTConnectkConfigDefault"`）
-- `num_planning_attempts` / `allowed_planning_time` — 规划参数
-- `joint_state` — 当前关节状态（只读）
-
-### 初始化参数
-
-```python
-MoveIt2(
-    node=node,
-    joint_names=["shoulder_roll_l_joint", "shoulder_yaw_l_joint",
-                 "elbow_pitch_l_joint", "elbow_yaw_l_joint",
-                 "wrist_pitch_l_joint", "wrist_roll_l_joint"],
-    base_link_name="base",           # 或 "shoulder_pitch_l_link"
-    end_effector_name="L_base_link", # 或特定工具 link
-    group_name="hand_L_Arn_Group",
-    callback_group=callback_group,
-)
+```bash
+ros2 pkg create tianyi2_control \
+  --build-type ament_python \
+  --dependencies rclpy std_msgs geometry_msgs trajectory_msgs
 ```
 
-> **注意**：pymoveit2 的 `robots/` 模块目前只有 Panda 机器人的预设。天轶2.0 **没有自己的 robot preset**，需在代码中手动指定 `joint_names`、`base_link_name`、`end_effector_name`。这些信息可从 SRDF 的 `<chain>` 定义和 URDF 中提取。
-
-### 异步执行模式
-
-pymoveit2 支持异步操作，参考 [ex_pose_goal.py](src/pymoveit2/examples/ex_pose_goal.py)：
+新节点入口点注册在 `setup.py` 的 `console_scripts`：
 ```python
-# 需要在后台线程中 spin 节点
-executor = rclpy.executors.MultiThreadedExecutor(2)
-executor.add_node(node)
-executor_thread = Thread(target=executor.spin, daemon=True)
-executor_thread.start()
-
-# 异步执行
-moveit2.move_to_pose(position=..., quat_xyzw=..., cartesian=False)
-future = moveit2.get_execution_future()
-while not future.done():
-    ...
+entry_points={
+    "console_scripts": [
+        "pose_goal_node = tianyi2_control.pose_goal_node:main",
+    ],
+},
 ```
 
 ---
@@ -185,8 +153,6 @@ while not future.done():
 | [initial_positions.yaml](src/demo/config/initial_positions.yaml) | 仿真初始关节角度 |
 | [pilz_cartesian_limits.yaml](src/demo/config/pilz_cartesian_limits.yaml) | Pilz 笛卡尔规划器限制 |
 
----
-
 ## 常见配置修改
 
 - **添加规划组**：编辑 `tianyi2_complete.srdf`（`<group>` + `<group_state>`），同步更新 `kinematics.yaml` 和 `ros2_controllers.yaml`
@@ -194,11 +160,6 @@ while not future.done():
 - **切换真实硬件**：修改 `tianyi2_complete.ros2_control.xacro` 的 `<plugin>` 和 `ros2_controllers.yaml`
 - **重新生成 MoveIt 配置**：`ros2 launch demo setup_assistant.launch.py`
 
-## 辅助脚本（`tianyi2_urdf/script/`）
+## 参考文档
 
-| 脚本 | 功能 |
-|---|---|
-| `check_link_and_update.py` | 将 CSV 关键参数表中的 link 名称与 URDF 交叉校核 |
-| `check_joint_and_update.py` | 将 CSV 关键参数表中的 joint 参数与 URDF 交叉校核 |
-| `make_mjcf_torq.py` | 将 URDF 转换为 MuJoCo MJCF 格式 |
-| `prime_to_convex.py` | 从原始 STL 生成凸包 STL（依赖 trimesh），用于碰撞检测网格更新 |
+- [docs/moveit2_guide.md](docs/moveit2_guide.md) — MoveIt 2 从配置到真机控制的全流程指南
