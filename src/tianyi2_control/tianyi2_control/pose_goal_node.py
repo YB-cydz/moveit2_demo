@@ -5,9 +5,9 @@
 
 话题：
   /left_arm/target_pose   — 左臂绝对位姿 (base 系)
-  /left_arm/delta_pose    — 左臂相对变换 (平移 base 系 | 旋转 base 系*末端朝向)
+  /left_arm/delta_pose    — 左臂相对变换 (平移 base 系 | 旋转 base 系)
   /right_arm/target_pose  — 右臂绝对位姿 (base 系)
-  /right_arm/delta_pose   — 右臂相对变换 (平移 base 系 | 旋转 base 系*末端朝向)
+  /right_arm/delta_pose   — 右臂相对变换 (平移 base 系 | 旋转 base 系)
 """
 
 import threading
@@ -124,11 +124,11 @@ class MoveIt2Client:
         c_qz = tf.transform.rotation.z
         c_qw = tf.transform.rotation.w
 
-        # 旋转：末端自身系 = current * delta
-        r_qw = c_qw*d_qw - c_qx*d_qx - c_qy*d_qy - c_qz*d_qz
-        r_qx = c_qw*d_qx + c_qx*d_qw + c_qy*d_qz - c_qz*d_qy
-        r_qy = c_qw*d_qy - c_qx*d_qz + c_qy*d_qw + c_qz*d_qx
-        r_qz = c_qw*d_qz + c_qx*d_qy - c_qy*d_qx + c_qz*d_qw
+        # 旋转：delta * current（base 系）
+        r_qw = d_qw*c_qw - d_qx*c_qx - d_qy*c_qy - d_qz*c_qz
+        r_qx = d_qw*c_qx + d_qx*c_qw + d_qy*c_qz - d_qz*c_qy
+        r_qy = d_qw*c_qy - d_qx*c_qz + d_qy*c_qw + d_qz*c_qx
+        r_qz = d_qw*c_qz + d_qx*c_qy - d_qy*c_qx + d_qz*c_qw
 
         self._logger.info(
             f"[{self._group}] Delta → Abs: "
@@ -282,29 +282,29 @@ class PoseGoalNode(Node):
 
         # left_arm 话题
         self._l_abs = self.create_subscription(
-            PoseStamped, "left_arm/target_pose",
+            PoseStamped, "/left_arm/target_pose",
             lambda m: self._abs_callback(m, self._left), 10,
         )
         self._l_rel = self.create_subscription(
-            PoseStamped, "left_arm/delta_pose",
+            PoseStamped, "/left_arm/delta_pose",
             lambda m: self._rel_callback(m, self._left), 10,
         )
         # right_arm 话题
         self._r_abs = self.create_subscription(
-            PoseStamped, "right_arm/target_pose",
+            PoseStamped, "/right_arm/target_pose",
             lambda m: self._abs_callback(m, self._right), 10,
         )
         self._r_rel = self.create_subscription(
-            PoseStamped, "right_arm/delta_pose",
+            PoseStamped, "/right_arm/delta_pose",
             lambda m: self._rel_callback(m, self._right), 10,
         )
 
         self.get_logger().info(
             "Ready.\n"
-            "  左臂 ABS : /pose_goal_node/left_arm/target_pose\n"
-            "  左臂 REL : /pose_goal_node/left_arm/delta_pose\n"
-            "  右臂 ABS : /pose_goal_node/right_arm/target_pose\n"
-            "  右臂 REL : /pose_goal_node/right_arm/delta_pose"
+            "  左臂 ABS : /left_arm/target_pose\n"
+            "  左臂 REL : /left_arm/delta_pose\n"
+            "  右臂 ABS : /right_arm/target_pose\n"
+            "  右臂 REL : /right_arm/delta_pose"
         )
 
     def _abs_callback(self, msg: PoseStamped, arm: MoveIt2Client):

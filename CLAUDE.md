@@ -112,10 +112,10 @@ shoulder_pitch_r_link → shoulder_roll_r_link → shoulder_yaw_r_link
 控制节点 (`tianyi2_control`) 通过 ROS 2 action/service 与 `move_group` 节点通信。
 
 ```
-/pose_goal_node/left_arm/target_pose  → 左臂绝对位姿
-/pose_goal_node/left_arm/delta_pose   → 左臂相对变换（平移base系 + 旋转末端系）
-/pose_goal_node/right_arm/target_pose → 右臂绝对位姿
-/pose_goal_node/right_arm/delta_pose  → 右臂相对变换
+/left_arm/target_pose  → 左臂绝对位姿
+/left_arm/delta_pose   → 左臂相对变换（平移base系 + 旋转末端系）
+/right_arm/target_pose → 右臂绝对位姿
+/right_arm/delta_pose  → 右臂相对变换
 ```
 
 ### 人形机器人参数（编写控制节点时使用）
