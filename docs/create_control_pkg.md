@@ -27,7 +27,7 @@ cd ~/moveit2_demo_ws/src
 
 ros2 pkg create tianyi2_control \
   --build-type ament_python \
-  --dependencies rclpy std_msgs geometry_msgs trajectory_msgs moveit_msgs \
+  --dependencies rclpy std_msgs geometry_msgs trajectory_msgs moveit_msgs tf2_ros tf2_geometry_msgs \
   --description "天轶2.0 MoveIt2 控制节点（直调 move_group service/action）" \
   --license Apache-2.0
 ```
@@ -47,11 +47,17 @@ ros2 pkg create tianyi2_control \
 """
 天轶2.0 位姿目标控制节点
 直接调用 move_group 的 GetMotionPlan service + ExecuteTrajectory action
+
+支持两种目标模式：
+  - 绝对位姿: frame_id="base" → 直接移动到目标位姿
+  - 末端相对旋转: frame_id="L_base_link" → 在当前位置上叠加旋转
 """
 
+import math
+import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from moveit_msgs.srv import GetMotionPlan
 from moveit_msgs.msg import (
     MotionPlanRequest,
@@ -63,8 +69,8 @@ from moveit_msgs.msg import (
 )
 from shape_msgs.msg import SolidPrimitive
 from moveit_msgs.action import ExecuteTrajectory
-
-import rclpy
+from tf2_ros import Buffer, TransformListener
+from tf2_geometry_msgs import do_transform_pose
 
 # =============================================================================
 # 天轶2.0 左臂参数
@@ -108,6 +114,10 @@ class MoveIt2Client:
             node, ExecuteTrajectory, "/execute_trajectory"
         )
 
+        # TF 监听（用于末端相对旋转）
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, node)
+
         self._logger.info("Waiting for /plan_kinematic_path ...")
         self._plan_client.wait_for_service(timeout_sec=10.0)
         self._logger.info("Waiting for /execute_trajectory ...")
@@ -116,7 +126,7 @@ class MoveIt2Client:
 
     # ── 位姿目标 ────────────────────────────────────────────────────────
     def plan_pose(self, x, y, z, qw=1.0, qx=0.0, qy=0.0, qz=0.0):
-        """笛卡尔位姿目标 → move_group 内部自动 IK → 规划 → 返回轨迹"""
+        """绝对笛卡尔位姿目标 → move_group 内部自动 IK → 规划 → 返回轨迹"""
 
         pos = PositionConstraint()
         pos.header.frame_id = BASE_LINK
@@ -146,6 +156,58 @@ class MoveIt2Client:
             orientation_constraints=[ori],
         )
         return self._plan(constraints)
+
+    # ── 末端相对旋转 ────────────────────────────────────────────────────
+    def plan_relative_pose(self, msg: PoseStamped):
+        """
+        在当前末端位姿上叠加相对变换，然后规划。
+
+        当 msg.header.frame_id == END_EFFECTOR 时：
+          - 从 TF 读取 L_base_link 在 base 下的当前位姿
+          - 将 msg 中的相对位姿叠加到当前位姿上
+          - 以叠加后的绝对位姿进行规划
+        """
+        if msg.header.frame_id == END_EFFECTOR:
+            # 查 TF: L_base_link 在 base 下的当前位姿
+            try:
+                tf: TransformStamped = self._tf_buffer.lookup_transform(
+                    BASE_LINK, END_EFFECTOR, rclpy.time.Time()
+                )
+            except Exception as e:
+                self._logger.error(f"TF lookup failed: {e}")
+                return None
+
+            # 在当前末端位上叠加相对变换
+            relative = PoseStamped()
+            relative.header.frame_id = END_EFFECTOR
+            relative.pose = msg.pose
+            absolute = do_transform_pose(relative, tf)
+
+            target_x = absolute.pose.position.x
+            target_y = absolute.pose.position.y
+            target_z = absolute.pose.position.z
+            target_qw = absolute.pose.orientation.w
+            target_qx = absolute.pose.orientation.x
+            target_qy = absolute.pose.orientation.y
+            target_qz = absolute.pose.orientation.z
+
+            self._logger.info(
+                f"Relative → Absolute: pos=({target_x:.3f},{target_y:.3f},{target_z:.3f})"
+            )
+        else:
+            # 绝对位姿，直接用
+            target_x = msg.pose.position.x
+            target_y = msg.pose.position.y
+            target_z = msg.pose.position.z
+            target_qw = msg.pose.orientation.w
+            target_qx = msg.pose.orientation.x
+            target_qy = msg.pose.orientation.y
+            target_qz = msg.pose.orientation.z
+
+        return self.plan_pose(
+            target_x, target_y, target_z,
+            target_qw, target_qx, target_qy, target_qz,
+        )
 
     # ── 关节目标 ────────────────────────────────────────────────────────
     def plan_joint(self, joint_positions):
@@ -230,24 +292,46 @@ class PoseGoalNode(Node):
         super().__init__("pose_goal_node")
         self._client = MoveIt2Client(self)
 
-        self._sub = self.create_subscription(
-            PoseStamped, "~/target_pose", self._pose_callback, 10
+        # 绝对位姿控制话题：/pose_goal_node/target_pose
+        self._abs_sub = self.create_subscription(
+            PoseStamped, "~/target_pose", self._absolute_callback, 10
+        )
+        # 相对变换控制话题：/pose_goal_node/delta_pose
+        self._rel_sub = self.create_subscription(
+            PoseStamped, "~/delta_pose", self._relative_callback, 10
         )
         self.get_logger().info(
-            "Ready. 发送 PoseStamped 到 /pose_goal_node/target_pose"
+            "Ready.\n"
+            "  绝对位姿: /pose_goal_node/target_pose\n"
+            "  相对变换: /pose_goal_node/delta_pose"
         )
 
-    def _pose_callback(self, msg: PoseStamped):
+    def _absolute_callback(self, msg: PoseStamped):
+        """绝对位姿目标：frame_id 为参考坐标系，目标为绝对位姿"""
         p = msg.pose.position
         o = msg.pose.orientation
         self.get_logger().info(
-            f"Target: x={p.x:.3f} y={p.y:.3f} z={p.z:.3f}"
+            f"[ABS  | {msg.header.frame_id}] "
+            f"x={p.x:.3f} y={p.y:.3f} z={p.z:.3f} "
+            f"qx={o.x:.3f} qy={o.y:.3f} qz={o.z:.3f} qw={o.w:.3f}"
         )
-
         traj = self._client.plan_pose(
             x=p.x, y=p.y, z=p.z,
             qw=o.w, qx=o.x, qy=o.y, qz=o.z,
         )
+        if traj:
+            self._client.execute(traj)
+
+    def _relative_callback(self, msg: PoseStamped):
+        """相对变换目标：在末端当前位姿上叠加 msg 中的变换"""
+        p = msg.pose.position
+        o = msg.pose.orientation
+        self.get_logger().info(
+            f"[REL  | {msg.header.frame_id}] "
+            f"dx={p.x:.3f} dy={p.y:.3f} dz={p.z:.3f} "
+            f"qx={o.x:.3f} qy={o.y:.3f} qz={o.z:.3f} qw={o.w:.3f}"
+        )
+        traj = self._client.plan_relative_pose(msg)
         if traj:
             self._client.execute(traj)
 
@@ -299,13 +383,24 @@ ros2 run tianyi2_control pose_goal_node
 ```
 
 ### 5.3 发位姿命令
+
 ```bash
+# ── 绝对位姿：直接移动到指定坐标 ──
 ros2 topic pub /pose_goal_node/target_pose geometry_msgs/msg/PoseStamped "
 header:
   frame_id: base
 pose:
   position: {x: 0.25, y: 0.1, z: 0.4}
   orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}
+" -1
+
+# ── 相对变换：末端原地 roll -90°（绕自身 X 轴旋转）──
+ros2 topic pub /pose_goal_node/delta_pose geometry_msgs/msg/PoseStamped "
+header:
+  frame_id: base
+pose:
+  position: {x: 0.0, y: 0.0, z: 0.0}
+  orientation: {w: 0.707, x: -0.707, y: 0.0, z: 0.0}
 " -1
 ```
 
@@ -326,14 +421,19 @@ pose:
 ## 7. 架构总结
 
 ```
-/pose_goal_node/target_pose (PoseStamped)
+/pose_goal_node/target_pose (绝对位姿)
+/pose_goal_node/delta_pose  (相对变换)
         │
         ▼
-  PoseGoalNode._pose_callback()
+  PoseGoalNode._absolute_callback / _relative_callback
         │
-        ├── MoveIt2Client.plan_pose()
+        ├── MoveIt2Client.plan_pose() ─────────── 绝对
         │     └── /plan_kinematic_path (GetMotionPlan service)
-        │           move_group: IK + RRTConnect → RobotTrajectory
+        │
+        ├── MoveIt2Client.plan_relative_pose() ── 相对
+        │     ├── 查 TF: L_base_link 当前位姿
+        │     ├── do_transform_pose() 叠加变换
+        │     └── /plan_kinematic_path (GetMotionPlan service)
         │
         └── MoveIt2Client.execute(trajectory)
               └── /execute_trajectory (ExecuteTrajectory action)

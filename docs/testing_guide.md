@@ -5,6 +5,8 @@
 ### 启动全流程
 
 ```bash
+source install/setup.bash
+
 # 终端 1：启动 MoveIt 仿真（move_group + RViz + ros2_control）
 ros2 launch demo demo.launch.py
 
@@ -29,22 +31,27 @@ timeout 8 bash -c 'ros2 run tf2_ros tf2_echo base L_base_link 2>&1' | head -10
 回到当前位置（不会动，仅验证链路）：
 
 ```bash
-#初始位置
+# ── 绝对位姿：直接移动到 base 系下的目标 ──
 ros2 topic pub /pose_goal_node/target_pose geometry_msgs/msg/PoseStamped "
-header:
-  frame_id: base
 pose:
   position: {x: 0.049, y: 0.272, z: 0.418}
   orientation: {x: -0.706, y: 0.706, z: 0.031, w: 0.030}
 " -1
 
-#抬手
+# 抬手
 ros2 topic pub /pose_goal_node/target_pose geometry_msgs/msg/PoseStamped "
-header:
-  frame_id: base
 pose:
-  position: {x: 0.310, y: 0.490, z: 1.115}
-  orientation: {x: -0.304, y: 0.024, z: -0.378, w: 0.874}
+  position: {x: 0.404, y: 0.453, z: 1.031}
+  orientation: {x: -0.453, y: 0.575, z: -0.467, w: 0.497}
+" -1
+
+# ── 相对变换：在末端当前位置上叠加（全部 base 系）──
+# 旋转 delta * current
+ros2 topic pub /pose_goal_node/delta_pose geometry_msgs/msg/PoseStamped "
+pose:
+  orientation: {w: 0.707, x: -0.707, y: 0.0, z: 0.0}
+" -1
+
 " -1
 ```
 

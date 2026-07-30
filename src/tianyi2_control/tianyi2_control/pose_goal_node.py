@@ -2,6 +2,10 @@
 """
 天轶2.0 位姿目标控制节点
 直调 move_group 的 /plan_kinematic_path service + /execute_trajectory action
+
+全部写死 base 坐标系：
+  /pose_goal_node/target_pose  — 绝对位姿（base 系）
+  /pose_goal_node/delta_pose   — 相对旋转（base 系，位置保持不变）
 """
 
 import threading
@@ -9,7 +13,7 @@ import threading
 import rclpy
 from rclpy.node import Node
 from rclpy.action import ActionClient
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose, Point, PoseStamped, TransformStamped
 from moveit_msgs.srv import GetMotionPlan
 from moveit_msgs.msg import (
     MotionPlanRequest,
@@ -20,6 +24,7 @@ from moveit_msgs.msg import (
 )
 from shape_msgs.msg import SolidPrimitive
 from moveit_msgs.action import ExecuteTrajectory
+from tf2_ros import Buffer, TransformListener
 
 
 # =============================================================================
@@ -45,14 +50,7 @@ ACCELERATION_SCALE = 0.5
 
 
 class MoveIt2Client:
-    """
-    MoveIt 2 轻量客户端，直接封装 move_group service/action。
-
-    用法:
-        client = MoveIt2Client(node)
-        traj = client.plan_pose(x=0.3, y=0.0, z=0.5, qw=1.0)
-        client.execute(traj)
-    """
+    """MoveIt 2 轻量客户端，封装 move_group service/action。"""
 
     def __init__(self, node: Node):
         self._node = node
@@ -65,17 +63,21 @@ class MoveIt2Client:
             node, ExecuteTrajectory, "/execute_trajectory"
         )
 
+        # TF 监听（delta_pose 需要读取末端当前位姿）
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, node)
+
         self._logger.info("Waiting for /plan_kinematic_path ...")
         self._plan_client.wait_for_service(timeout_sec=10.0)
         self._logger.info("Waiting for /execute_trajectory ...")
         self._exec_client.wait_for_server(timeout_sec=10.0)
         self._logger.info("MoveIt2Client ready")
 
-    # -------------------------------------------------------------------------
-    # 位姿目标规划
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 绝对位姿目标（base 系）
+    # =========================================================================
     def plan_pose(self, x, y, z, qw=1.0, qx=0.0, qy=0.0, qz=0.0):
-        """规划到笛卡尔位姿，move_group 内部自动做 IK"""
+        """移动到 base 系下的绝对位姿。"""
         constraints = Constraints()
         constraints.position_constraints.append(
             self._make_position_constraint(x, y, z)
@@ -85,11 +87,57 @@ class MoveIt2Client:
         )
         return self._plan(constraints)
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # 相对变换（全部 base 系）
+    # =========================================================================
+    def plan_relative_pose(self, d_qw, d_qx, d_qy, d_qz):
+        """
+        在末端当前位置上叠加 base 系旋转（不移位）。
+
+        位置保持不变，旋转：delta * current
+        """
+        try:
+            tf: TransformStamped = self._tf_buffer.lookup_transform(
+                BASE_LINK, END_EFFECTOR, rclpy.time.Time()
+            )
+        except Exception as e:
+            self._logger.error(f"TF lookup failed: {e}")
+            return None
+
+        # 当前位置（保持不变）
+        cx, cy, cz = (
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            tf.transform.translation.z,
+        )
+
+        # 当前朝向
+        c_qx, c_qy, c_qz, c_qw = (
+            tf.transform.rotation.x,
+            tf.transform.rotation.y,
+            tf.transform.rotation.z,
+            tf.transform.rotation.w,
+        )
+
+        # 旋转：delta * current（base 系）
+        r_qw = d_qw*c_qw - d_qx*c_qx - d_qy*c_qy - d_qz*c_qz
+        r_qx = d_qw*c_qx + d_qx*c_qw + d_qy*c_qz - d_qz*c_qy
+        r_qy = d_qw*c_qy - d_qx*c_qz + d_qy*c_qw + d_qz*c_qx
+        r_qz = d_qw*c_qz + d_qx*c_qy - d_qy*c_qx + d_qz*c_qw
+
+        self._logger.info(
+            f"Delta rot → Abs: x={cx:.3f} y={cy:.3f} z={cz:.3f} "
+            f"qw={r_qw:.3f} qx={r_qx:.3f} qy={r_qy:.3f} qz={r_qz:.3f}"
+        )
+        return self.plan_pose(
+            x=cx, y=cy, z=cz, qw=r_qw, qx=r_qx, qy=r_qy, qz=r_qz,
+        )
+
+    # =========================================================================
     # 关节目标规划
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def plan_joint(self, joint_positions):
-        """规划到指定关节角度（跳过 IK）"""
+        """规划到指定关节角度（跳过 IK）。"""
         constraints = Constraints()
         for name, val in zip(JOINT_NAMES, joint_positions):
             jc = JointConstraint()
@@ -101,9 +149,9 @@ class MoveIt2Client:
             constraints.joint_constraints.append(jc)
         return self._plan(constraints)
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # 内部：发送规划请求
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def _plan(self, goal_constraints):
         req = MotionPlanRequest()
         req.group_name = GROUP_NAME
@@ -142,11 +190,10 @@ class MoveIt2Client:
         )
         return traj
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # 执行轨迹
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def execute(self, trajectory):
-        """通过 ExecuteTrajectory action 发送轨迹（阻塞直到完成）"""
         goal_msg = ExecuteTrajectory.Goal()
         goal_msg.trajectory = trajectory
 
@@ -176,22 +223,20 @@ class MoveIt2Client:
             self._logger.info("Execute done")
             return True
         else:
-            self._logger.error(f"Execute failed: code={result.result.error_code.val}")
+            self._logger.error(
+                f"Execute failed: code={result.result.error_code.val}"
+            )
             return False
 
-    # -------------------------------------------------------------------------
+    # =========================================================================
     # 构建约束消息 helper
-    # -------------------------------------------------------------------------
+    # =========================================================================
     def _make_position_constraint(self, x, y, z):
-        from geometry_msgs.msg import Pose, Point
-
         pc = PositionConstraint()
         pc.header.frame_id = BASE_LINK
         pc.link_name = END_EFFECTOR
         pc.weight = 1.0
-        sphere = SolidPrimitive(
-            type=SolidPrimitive.SPHERE, dimensions=[0.001]
-        )
+        sphere = SolidPrimitive(type=SolidPrimitive.SPHERE, dimensions=[0.001])
         pc.constraint_region.primitives.append(sphere)
         pose = Pose()
         pose.position = Point(x=x, y=y, z=z)
@@ -217,38 +262,60 @@ class MoveIt2Client:
 # ROS 2 节点
 # =============================================================================
 class PoseGoalNode(Node):
-    """订阅位姿目标话题，规划后执行"""
 
     def __init__(self):
         super().__init__("pose_goal_node")
         self._client = MoveIt2Client(self)
 
-        self._sub = self.create_subscription(
-            PoseStamped, "~/target_pose", self._pose_callback, 10
+        # 绝对位姿：base 系
+        self._abs_sub = self.create_subscription(
+            PoseStamped, "~/target_pose", self._absolute_callback, 10
+        )
+        # 相对变换：平移 base 系 + 旋转 base 系
+        self._rel_sub = self.create_subscription(
+            PoseStamped, "~/delta_pose", self._relative_callback, 10
         )
         self.get_logger().info(
-            "Ready — publish PoseStamped to /pose_goal_node/target_pose"
+            "Ready.\n"
+            "  [ABS]  /pose_goal_node/target_pose\n"
+            "  [REL]  /pose_goal_node/delta_pose"
         )
 
-    def _pose_callback(self, msg: PoseStamped):
-        pos = msg.pose.position
-        ori = msg.pose.orientation
+    # ── 绝对位姿 ─────────────────────────────────────────────────────────
+    def _absolute_callback(self, msg: PoseStamped):
+        p = msg.pose.position
+        o = msg.pose.orientation
         self.get_logger().info(
-            f"Target: x={pos.x:.3f} y={pos.y:.3f} z={pos.z:.3f}"
+            f"[ABS] x={p.x:.3f} y={p.y:.3f} z={p.z:.3f}"
         )
-
-        # 在后台线程中执行规划+执行，不阻塞 executor
-        thread = threading.Thread(
+        threading.Thread(
             target=self._do_plan_and_execute,
-            args=(pos.x, pos.y, pos.z,
-                  ori.w, ori.x, ori.y, ori.z),
+            args=(p.x, p.y, p.z, o.w, o.x, o.y, o.z),
             daemon=True,
-        )
-        thread.start()
+        ).start()
 
+    # ── 相对旋转 ─────────────────────────────────────────────────────────
+    def _relative_callback(self, msg: PoseStamped):
+        o = msg.pose.orientation
+        self.get_logger().info(
+            f"[REL] qx={o.x:.3f} qy={o.y:.3f} qz={o.z:.3f} qw={o.w:.3f}"
+        )
+        threading.Thread(
+            target=self._do_relative_plan_and_execute,
+            args=(o.w, o.x, o.y, o.z),
+            daemon=True,
+        ).start()
+
+    # ── 规划 + 执行 ──────────────────────────────────────────────────────
     def _do_plan_and_execute(self, x, y, z, qw, qx, qy, qz):
-        """在独立线程中调用 service/action，rclpy 内部自行创建 executor"""
         traj = self._client.plan_pose(x=x, y=y, z=z, qw=qw, qx=qx, qy=qy, qz=qz)
+        if traj:
+            self._client.execute(traj)
+
+    def _do_relative_plan_and_execute(self, d_qw, d_qx, d_qy, d_qz):
+        traj = self._client.plan_relative_pose(
+            d_qw=d_qw, d_qx=d_qx, d_qy=d_qy, d_qz=d_qz,
+        )
         if traj:
             self._client.execute(traj)
 
