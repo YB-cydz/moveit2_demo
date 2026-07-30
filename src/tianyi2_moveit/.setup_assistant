@@ -6,8 +6,8 @@ moveit_setup_assistant_config:
     relative_path: config/tianyi2_complete.srdf
   package_settings:
     author_name: 111
-    author_email: 111@qq.com
-    generated_timestamp: 1785400011
+    author_email: 111@163.com
+    generated_timestamp: 1785416401
   control_xacro:
     command:
       - position

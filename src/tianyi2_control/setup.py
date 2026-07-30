@@ -10,6 +10,7 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        ('share/' + package_name + '/config', ['config/motor_config.yaml']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -21,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'pose_goal_node = tianyi2_control.pose_goal_node:main',
+            'bridge_node = tianyi2_control.bridge_node:main',
         ],
     },
 )

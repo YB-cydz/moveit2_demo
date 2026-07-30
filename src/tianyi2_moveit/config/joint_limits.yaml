@@ -28,6 +28,16 @@ joint_limits:
     max_velocity: 10.471975511965978
     has_acceleration_limits: false
     max_acceleration: 0
+  shoulder_pitch_l_joint:
+    has_velocity_limits: true
+    max_velocity: 9.2153384505300586
+    has_acceleration_limits: false
+    max_acceleration: 0
+  shoulder_pitch_r_joint:
+    has_velocity_limits: true
+    max_velocity: 9.2153384505300586
+    has_acceleration_limits: false
+    max_acceleration: 0
   shoulder_roll_l_joint:
     has_velocity_limits: true
     max_velocity: 3.9793506945470711

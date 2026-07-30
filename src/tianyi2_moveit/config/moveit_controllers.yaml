@@ -5,11 +5,12 @@ moveit_controller_manager: moveit_simple_controller_manager/MoveItSimpleControll
 moveit_simple_controller_manager:
   controller_names:
     - L_Arm_Group_controller
-    - R_Arm_group_controller
+    - R_Arm_Group_controller
 
   L_Arm_Group_controller:
     type: FollowJointTrajectory
     joints:
+      - shoulder_pitch_l_joint
       - shoulder_roll_l_joint
       - shoulder_yaw_l_joint
       - elbow_pitch_l_joint
@@ -18,9 +19,10 @@ moveit_simple_controller_manager:
       - wrist_roll_l_joint
     action_ns: follow_joint_trajectory
     default: true
-  R_Arm_group_controller:
+  R_Arm_Group_controller:
     type: FollowJointTrajectory
     joints:
+      - shoulder_pitch_r_joint
       - shoulder_roll_r_joint
       - shoulder_yaw_r_joint
       - elbow_pitch_r_joint

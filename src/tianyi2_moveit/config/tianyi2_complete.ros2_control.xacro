@@ -8,6 +8,13 @@
                 <!-- By default, set up controllers for simulation. This won't work on real hardware -->
                 <plugin>mock_components/GenericSystem</plugin>
             </hardware>
+            <joint name="shoulder_pitch_l_joint">
+                <command_interface name="position"/>
+                <state_interface name="position">
+                  <param name="initial_value">${initial_positions['shoulder_pitch_l_joint']}</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+            </joint>
             <joint name="shoulder_roll_l_joint">
                 <command_interface name="position"/>
                 <state_interface name="position">
@@ -47,6 +54,13 @@
                 <command_interface name="position"/>
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['wrist_roll_l_joint']}</param>
+                </state_interface>
+                <state_interface name="velocity"/>
+            </joint>
+            <joint name="shoulder_pitch_r_joint">
+                <command_interface name="position"/>
+                <state_interface name="position">
+                  <param name="initial_value">${initial_positions['shoulder_pitch_r_joint']}</param>
                 </state_interface>
                 <state_interface name="velocity"/>
             </joint>
@@ -93,36 +107,30 @@
                 <state_interface name="velocity"/>
             </joint>
 
-            <!-- 仅上报状态（不参与控制），补全 TF 链 -->
-            <joint name="shoulder_pitch_l_joint">
+            <!-- 仅发布状态，不参与控制（补全 base→手臂 的 TF 链） -->
+            <joint name="first_leg_pitch_joint">
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['shoulder_pitch_l_joint']}</param>
+                  <param name="initial_value">${initial_positions['first_leg_pitch_joint']}</param>
                 </state_interface>
-            </joint>
-            <joint name="shoulder_pitch_r_joint">
-                <state_interface name="position">
-                  <param name="initial_value">${initial_positions['shoulder_pitch_r_joint']}</param>
-                </state_interface>
-            </joint>
-            <joint name="waist_yaw_joint">
-                <state_interface name="position">
-                  <param name="initial_value">${initial_positions['waist_yaw_joint']}</param>
-                </state_interface>
-            </joint>
-            <joint name="waist_pitch_joint">
-                <state_interface name="position">
-                  <param name="initial_value">${initial_positions['waist_pitch_joint']}</param>
-                </state_interface>
+                <state_interface name="velocity"/>
             </joint>
             <joint name="second_leg_pitch_joint">
                 <state_interface name="position">
                   <param name="initial_value">${initial_positions['second_leg_pitch_joint']}</param>
                 </state_interface>
+                <state_interface name="velocity"/>
             </joint>
-            <joint name="first_leg_pitch_joint">
+            <joint name="waist_pitch_joint">
                 <state_interface name="position">
-                  <param name="initial_value">${initial_positions['first_leg_pitch_joint']}</param>
+                  <param name="initial_value">${initial_positions['waist_pitch_joint']}</param>
                 </state_interface>
+                <state_interface name="velocity"/>
+            </joint>
+            <joint name="waist_yaw_joint">
+                <state_interface name="position">
+                  <param name="initial_value">${initial_positions['waist_yaw_joint']}</param>
+                </state_interface>
+                <state_interface name="velocity"/>
             </joint>
 
         </ros2_control>

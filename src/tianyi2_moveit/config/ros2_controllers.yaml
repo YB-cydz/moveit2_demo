@@ -7,7 +7,7 @@ controller_manager:
       type: joint_trajectory_controller/JointTrajectoryController
 
 
-    R_Arm_group_controller:
+    R_Arm_Group_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
 
@@ -17,6 +17,7 @@ controller_manager:
 L_Arm_Group_controller:
   ros__parameters:
     joints:
+      - shoulder_pitch_l_joint
       - shoulder_roll_l_joint
       - shoulder_yaw_l_joint
       - elbow_pitch_l_joint
@@ -28,9 +29,10 @@ L_Arm_Group_controller:
     state_interfaces:
       - position
       - velocity
-R_Arm_group_controller:
+R_Arm_Group_controller:
   ros__parameters:
     joints:
+      - shoulder_pitch_r_joint
       - shoulder_roll_r_joint
       - shoulder_yaw_r_joint
       - elbow_pitch_r_joint
