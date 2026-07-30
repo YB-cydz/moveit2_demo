@@ -2,14 +2,19 @@
 
 initial_positions:
   elbow_pitch_l_joint: 0
+  elbow_pitch_r_joint: 0
   elbow_yaw_l_joint: 0
+  elbow_yaw_r_joint: 0
   shoulder_roll_l_joint: 0
+  shoulder_roll_r_joint: 0
   shoulder_yaw_l_joint: 0
+  shoulder_yaw_r_joint: 0
   wrist_pitch_l_joint: 0
+  wrist_pitch_r_joint: 0
   wrist_roll_l_joint: 0
-  left_tcp_joint: 0
-  left_hand_to_tcp: 0
+  wrist_roll_r_joint: 0
   shoulder_pitch_l_joint: 0
+  shoulder_pitch_r_joint: 0
   waist_yaw_joint: 0
   waist_pitch_joint: 0
   second_leg_pitch_joint: 0

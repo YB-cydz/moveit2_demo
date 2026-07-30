@@ -3,14 +3,18 @@ controller_manager:
   ros__parameters:
     update_rate: 100  # Hz
 
-    hand_L_Arn_Group_controller:
+    L_Arm_Group_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+
+    R_Arm_group_controller:
       type: joint_trajectory_controller/JointTrajectoryController
 
 
     joint_state_broadcaster:
       type: joint_state_broadcaster/JointStateBroadcaster
 
-hand_L_Arn_Group_controller:
+L_Arm_Group_controller:
   ros__parameters:
     joints:
       - shoulder_roll_l_joint
@@ -19,6 +23,20 @@ hand_L_Arn_Group_controller:
       - elbow_yaw_l_joint
       - wrist_pitch_l_joint
       - wrist_roll_l_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+R_Arm_group_controller:
+  ros__parameters:
+    joints:
+      - shoulder_roll_r_joint
+      - shoulder_yaw_r_joint
+      - elbow_pitch_r_joint
+      - elbow_yaw_r_joint
+      - wrist_pitch_r_joint
+      - wrist_roll_r_joint
     command_interfaces:
       - position
     state_interfaces:

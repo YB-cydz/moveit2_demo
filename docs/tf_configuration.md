@@ -12,8 +12,9 @@ TF 树由 `robot_state_publisher` 根据 **URDF** + **`/joint_states`** 发布�
 
 **TF 链断裂的原因只有一种：`/joint_states` 不全。** `robot_state_publisher` 在 URDF 中找到某关节但 `/joint_states` 没有它，就跳过这个关节的 TF。
 
-天轶2.0 从 `base` 到 `L_base_link` 的完整链：
+天轶2.0 从 `base` 到末端的完整链：
 
+**左臂：**
 ```
 base → first_leg_pitch → second_leg_pitch → waist_pitch → waist_yaw
   → shoulder_pitch_l → shoulder_roll_l → shoulder_yaw_l
@@ -21,7 +22,15 @@ base → first_leg_pitch → second_leg_pitch → waist_pitch → waist_yaw
   → left_tcp → L_base_link
 ```
 
-以上所有关节的值都必须出现在 `/joint_states` 中，TF 树才完整。
+**右臂：**
+```
+base → first_leg_pitch → second_leg_pitch → waist_pitch → waist_yaw
+  → shoulder_pitch_r → shoulder_roll_r → shoulder_yaw_r
+  → elbow_pitch_r → elbow_yaw_r → wrist_pitch_r → wrist_roll_r
+  → right_tcp → R_base_link
+```
+
+以上所有关节的值都必须出现在 `/joint_states` 中，TF 树才完整。双臂共用 base→waist_yaw 段，在 shoulder_pitch_l/r 处分叉。
 
 ---
 
@@ -59,7 +68,10 @@ ros2 launch demo demo.launch.py
 验证 TF 链：
 
 ```bash
-timeout 8 bash -c 'ros2 run tf2_ros tf2_echo base L_base_link 2>&1' | head -10
+# 左臂
+timeout 8 ros2 run tf2_ros tf2_echo base L_base_link 2>&1 | head -6
+# 右臂
+timeout 8 ros2 run tf2_ros tf2_echo base R_base_link 2>&1 | head -6
 ```
 
 ---
