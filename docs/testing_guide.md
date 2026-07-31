@@ -51,11 +51,19 @@ pose:
 
 ```bash
 # ── 绝对位姿 ──
-ros2 topic pub /right_arm/target_pose geometry_msgs/msg/PoseStamped "
+#左
+ros2 topic pub /left_arm/target_pose geometry_msgs/msg/PoseStamped "pose: {position: {x: 0.1696, y: 0.3591, z: 0.5818}, orientation: {x: -0.4898, y: 0.8601, z: -0.1363, w: -0.0416}}" -1
+
+#右
+ros2 topic pub /right_arm/target_pose geometry_msgs/msg/PoseStamped "pose: {position: {x: 0.0661, y: -0.4188, z: 0.5897}, orientation: {x: 0.7325, y: 0.6806, z: 0.0081, w: -0.0090}}" -1
+
+#相对位移
+ros2 topic pub /right_arm/delta_pose geometry_msgs/msg/PoseStamped "
 pose:
-  position: {x: 0.376, y: -0.624, z: 0.911}
-  orientation: {x: 0.477, y: 0.520, z: 0.479, w: 0.522}
+  position: {x: -0.1, y: 0.0, z: 0.1}
+  orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}
 " -1
+
 
 # ── 相对旋转：末端绕 base 系 X 轴 roll -90° ──
 ros2 topic pub /right_arm/delta_pose geometry_msgs/msg/PoseStamped "
@@ -85,8 +93,8 @@ pose_goal_node  →  move_group  →  /L_Arm_Group_controller/joint_trajectory (
                                       │
                                 bridge_node 订阅
                                       │
-                              /arm/cmd_pos
-                              (CmdSetMotorPosition)
+                              /arm/cmd_ctrl
+                              (CmdMotorCtrl)
                                       │
                                机器人 body_control
 
@@ -165,14 +173,17 @@ ros2 topic echo /L_Arm_Group_controller/state --field desired --once
 ros2 topic echo /R_Arm_Group_controller/state --field desired --once
 
 # 查看桥接节点发布的电机指令
-ros2 topic echo /arm/cmd_pos
+ros2 topic echo /arm/cmd_ctrl
 
-# 检查双臂 TF 链完整性
-ros2 run tf2_ros tf2_echo base L_base_link
-ros2 run tf2_ros tf2_echo base R_base_link
+# 读取末端位姿并输出控制指令
+ros2 run tianyi2_control ee_pose
+
+# 检查双臂末端相对 base 的位姿（打印一条后自动退出）
+timeout 2 ros2 run tf2_ros tf2_echo base L_base_link
+timeout 2 ros2 run tf2_ros tf2_echo base R_base_link
 
 # 检查相机 TF
-ros2 run tf2_ros tf2_echo base camera_head_link
+timeout 2 ros2 run tf2_ros tf2_echo base camera_head_link
 
 # 查看 move_group 服务列表
 ros2 service list | grep -E "plan|kinematic|cartesian|ik"

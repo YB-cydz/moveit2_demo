@@ -25,6 +25,7 @@ setup(
             'pose_goal_node = tianyi2_control.pose_goal_node:main',
             'bridge_node = tianyi2_control.bridge_node:main',
             'joint_state_publisher = tianyi2_control.joint_state_publisher:main',
+            'ee_pose = tianyi2_control.end_effector_pose:main',
         ],
     },
 )

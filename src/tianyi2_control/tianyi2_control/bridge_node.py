@@ -7,12 +7,9 @@
   /R_Arm_Group_controller/state → 右臂队列 (FIFO)
   /arm/status                   → 电机实际位置
 
-速度:
-  spd (rad/s) = (路点pos - 上一路点pos) / dt × speed_ratio
-  超过 motor_speed_limits[RPM] 的截断到限速值（0 = 不限速）
+spd 和 tor 写死为 0，kp/kd 从配置文件逐电机读取。
 """
 
-import math
 import os
 import threading
 
@@ -20,9 +17,9 @@ import rclpy
 from rclpy.node import Node
 from control_msgs.msg import JointTrajectoryControllerState
 from bodyctrl_msgs.msg import (
-    CmdSetMotorPosition,
+    CmdMotorCtrl,
+    MotorCtrl,
     MotorStatusMsg,
-    SetMotorPosition,
 )
 
 try:
@@ -57,36 +54,35 @@ def _load_motor_config():
                 with open(p, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f)
                 if isinstance(data, dict):
-                    j2m, cur, lim = {}, {}, {}
+                    j2m = {}
                     for k, v in data.get("joint_to_motor", {}).items():
                         j2m[str(k)] = int(v)
-                    for k, v in data.get("motor_currents", {}).items():
-                        cur[int(k)] = float(v)
-                    for k, v in data.get("motor_speed_limits", {}).items():
-                        lim[int(k)] = float(v)
-                    ratio = float(data.get("speed_ratio", 0.5))
-                    return j2m, cur, lim, ratio
+                    kp_map = {}
+                    for k, v in data.get("motor_kp", {}).items():
+                        kp_map[int(k)] = float(v)
+                    kd_map = {}
+                    for k, v in data.get("motor_kd", {}).items():
+                        kd_map[int(k)] = float(v)
+                    kp_scale = float(data.get("kp_scale", 1.0))
+                    return j2m, kp_map, kd_map, kp_scale
             except Exception:
                 pass
-    return {}, {}, {}, 0.5
+    return {}, {}, {}, 1.0
 
 
-JOINT_TO_MOTOR, MOTOR_CURRENTS, MOTOR_SPEED_LIMITS, SPEED_RATIO = _load_motor_config()
+JOINT_TO_MOTOR, MOTOR_KP, MOTOR_KD, KP_SCALE = _load_motor_config()
 
 CONTROL_HZ = 50.0
 REACHED_TOLERANCE = 0.05  # rad
-RPM_TO_RAD_S = 2.0 * math.pi / 60.0
 
 
 class Arm:
-    """单臂队列状态。queue: [(timestamp_sec, {motor_id: pos})] """
+    """单臂队列状态。queue: [{motor_id: pos}] """
 
     def __init__(self, side: str):
         self.side = side
-        self.queue: list = []                       # [(float, dict[int,float])]
+        self.queue: list = []                       # [dict[int,float]]
         self.sent: dict[int, float] = {}            # 当前目标
-        self.speeds: dict[int, float] = {}          # 计算出的 spd (rad/s)
-        self.sent_time: float = 0.0                 # 当前目标的时间戳
 
 
 class BridgeNode(Node):
@@ -100,7 +96,16 @@ class BridgeNode(Node):
         self._motor_pos: dict[int, float] = {}
         self._lock = threading.Lock()
 
-        self._pub = self.create_publisher(CmdSetMotorPosition, "/arm/cmd_pos", 10)
+        # ── 调试计数 ──
+        self._ready = False  # 收到首次 /arm/status 后才开始处理队列
+        self._l_recv = 0
+        self._r_recv = 0
+        self._pub_count = 0
+        self._missing_logged: set[int] = set()
+        self._l_baseline: dict[int, float] = {}  # 左臂空闲基线
+        self._r_baseline: dict[int, float] = {}  # 右臂空闲基线
+
+        self._pub = self.create_publisher(CmdMotorCtrl, "/arm/cmd_ctrl", 10)
 
         self._create_ctrl_sub("/L_Arm_Group_controller/state", self._l_arm)
         self._create_ctrl_sub("/R_Arm_Group_controller/state", self._r_arm)
@@ -112,12 +117,10 @@ class BridgeNode(Node):
         period = 1.0 / CONTROL_HZ
         self._timer = self.create_timer(period, self._tick)
 
-        loaded = len(MOTOR_CURRENTS)
-        if loaded > 0:
+        if JOINT_TO_MOTOR:
             self.get_logger().info(
                 f"Loaded config: {len(JOINT_TO_MOTOR)} joints → "
-                f"{loaded} motors, {len(MOTOR_SPEED_LIMITS)} speed limits, "
-                f"speed_ratio={SPEED_RATIO}"
+                f"{len(set(JOINT_TO_MOTOR.values()))} motors"
             )
         else:
             self.get_logger().warn("No motor_config.yaml found")
@@ -131,11 +134,11 @@ class BridgeNode(Node):
     # 控制器状态 → 入队 (时间戳 + 位置)
     # =========================================================================
     def _create_ctrl_sub(self, topic: str, arm: Arm):
+        cnt = [0]  # mutable counter for closure
+
         def callback(msg: JointTrajectoryControllerState):
             if not msg.joint_names:
                 return
-
-            now = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
 
             wp: dict[int, float] = {}
             for name, pos in zip(msg.joint_names, msg.desired.positions):
@@ -147,11 +150,34 @@ class BridgeNode(Node):
                 return
 
             with self._lock:
-                if arm.queue:
-                    _, last_wp = arm.queue[-1]
-                    if wp == last_wp:
-                        return
-                arm.queue.append((now, wp))
+                baseline = self._l_baseline if arm.side == "L" else self._r_baseline
+                if not baseline:
+                    # 首帧控制器状态作为空闲基线，不下发
+                    if arm.side == "L":
+                        self._l_baseline = wp
+                    else:
+                        self._r_baseline = wp
+                    self.get_logger().info(
+                        f"[{arm.side}] Idle baseline captured ({len(wp)} motors)"
+                    )
+                    return
+                # 丢弃等于空闲基线的路点
+                if wp == baseline:
+                    return
+                if arm.queue and wp == arm.queue[-1]:
+                    return
+                arm.queue.append(wp)
+                is_first = len(arm.queue) == 1
+
+            cnt[0] += 1
+            if is_first:
+                self.get_logger().info(
+                    f"[{arm.side}] Trajectory started ({len(wp)} motors)"
+                )
+            elif cnt[0] % 50 == 0:
+                self.get_logger().debug(
+                    f"[{arm.side}] Recv {cnt[0]}, queue={len(arm.queue)}"
+                )
 
         self.create_subscription(
             JointTrajectoryControllerState, topic, callback, 10
@@ -173,50 +199,56 @@ class BridgeNode(Node):
         changed = False
 
         with self._lock:
+            if not self._ready:
+                # 等待首次 /arm/status 到达
+                has_any = any(
+                    mid in self._motor_pos for mid in JOINT_TO_MOTOR.values()
+                )
+                if not has_any:
+                    return
+                # 首次: 清空空闲路点，以当前电机位置作为初始目标
+                self._l_arm.queue.clear()
+                self._r_arm.queue.clear()
+                init = {}
+                for mid in JOINT_TO_MOTOR.values():
+                    cur = self._motor_pos.get(mid)
+                    if cur is not None:
+                        init[mid] = cur
+                if init:
+                    self._l_arm.sent = {mid: init[mid] for mid in init if mid <= 17}
+                    self._r_arm.sent = {mid: init[mid] for mid in init if mid >= 21}
+                self._ready = True
+                self.get_logger().info(
+                    f"Initialized from /arm/status — holding {len(init)} motors"
+                )
+                return
+
             pos = dict(self._motor_pos)
 
             for arm in (self._l_arm, self._r_arm):
                 if not arm.queue:
                     continue
-                t_now, wp = arm.queue[0]
+                wp = arm.queue[0]
 
                 if not arm.sent:
                     arm.sent = wp
-                    arm.sent_time = t_now
-                    arm.speeds = {mid: 0.0 for mid in wp}
                     arm.queue.pop(0)
                     changed = True
+                    vals = ", ".join(f"{mid}={wp[mid]:.3f}" for mid in sorted(wp.keys()))
+                    self.get_logger().info(
+                        f"[{arm.side}] INITIAL SEND: {vals}"
+                    )
 
                 elif self._reached(arm.sent, pos):
-                    dt = t_now - arm.sent_time
-                    self._compute_speeds(arm, wp, dt)
                     arm.sent = wp
-                    arm.sent_time = t_now
                     arm.queue.pop(0)
                     changed = True
+                    self.get_logger().info(
+                        f"[{arm.side}] REACHED → NEXT: queue={len(arm.queue)}"
+                    )
 
             if changed:
                 self._publish_combined()
-
-    # =========================================================================
-    # 速度: spd = (wp - sent) / dt × ratio, 截断到限速
-    # =========================================================================
-    def _compute_speeds(self, arm: Arm, wp: dict[int, float], dt: float):
-        arm.speeds.clear()
-        if dt < 1e-6:
-            dt = 0.02
-
-        for mid, new_pos in wp.items():
-            old_pos = arm.sent.get(mid, new_pos)
-            dp = new_pos - old_pos
-            spd = (dp / dt) * SPEED_RATIO
-
-            limit_rpm = MOTOR_SPEED_LIMITS.get(mid, 0.0)
-            if limit_rpm > 0:
-                limit_rad_s = limit_rpm * RPM_TO_RAD_S
-                spd = max(-limit_rad_s, min(limit_rad_s, spd))
-
-            arm.speeds[mid] = spd
 
     # =========================================================================
     # 到达判断
@@ -225,6 +257,9 @@ class BridgeNode(Node):
         for mid, tgt in targets.items():
             cur = current.get(mid)
             if cur is None:
+                if mid not in self._missing_logged:
+                    self.get_logger().warn(f"  Motor {mid} not in /arm/status")
+                    self._missing_logged.add(mid)
                 return False
             if abs(cur - tgt) > REACHED_TOLERANCE:
                 return False
@@ -234,21 +269,30 @@ class BridgeNode(Node):
     # 合并双臂 → /arm/cmd_pos
     # =========================================================================
     def _publish_combined(self):
-        cmd = CmdSetMotorPosition()
+        cmd = CmdMotorCtrl()
         cmd.header.stamp = self.get_clock().now().to_msg()
 
         for mid in sorted(JOINT_TO_MOTOR.values()):
-            pos = self._l_arm.sent.get(mid) or self._r_arm.sent.get(mid)
+            arm = self._l_arm if mid <= 17 else self._r_arm
+            pos = arm.sent.get(mid)
             if pos is None:
                 continue
-            sp = SetMotorPosition()
-            sp.name = mid
-            sp.pos = pos
-            sp.spd = self._l_arm.speeds.get(mid, self._r_arm.speeds.get(mid, 0.0))
-            sp.cur = MOTOR_CURRENTS.get(mid, 0.0)
-            cmd.cmds.append(sp)
+            mc = MotorCtrl()
+            mc.name = mid
+            mc.kp = MOTOR_KP.get(mid, 0.0) * KP_SCALE
+            mc.kd = MOTOR_KD.get(mid, 0.0)
+            mc.pos = pos
+            mc.spd = 0.0
+            mc.tor = 0.0
+            cmd.cmds.append(mc)
 
         self._pub.publish(cmd)
+
+        self._pub_count += 1
+        if self._pub_count <= 3 or self._pub_count % 50 == 0:
+            self.get_logger().info(
+                f"[PUB #{self._pub_count}] {len(cmd.cmds)} motors → /arm/cmd_ctrl"
+            )
 
 
 def main():
