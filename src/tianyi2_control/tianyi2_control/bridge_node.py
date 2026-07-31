@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """
-天轶2.0 桥接节点 v2
-订阅 move_group 的 /display_planned_path → 逐路点闭环执行 → /arm/cmd_pos
+天轶2.0 桥接节点 v5 — 双臂独立队列，差分速度
 
-- 接收新轨迹时替换当前待执行队列
-- 异步线程 10Hz：读取 /arm/status → 判断是否到达当前路点（误差 < 0.05 rad）
-- 到达后发送下一路点，直到轨迹执行完毕
+数据流:
+  /L_Arm_Group_controller/state → 左臂队列 (FIFO)
+  /R_Arm_Group_controller/state → 右臂队列 (FIFO)
+  /arm/status                   → 电机实际位置
+
+速度:
+  spd (rad/s) = (路点pos - 上一路点pos) / dt × speed_ratio
+  超过 motor_speed_limits[RPM] 的截断到限速值（0 = 不限速）
 """
 
+import math
 import os
 import threading
-import time
 
 import rclpy
 from rclpy.node import Node
-from moveit_msgs.msg import DisplayTrajectory
-from bodyctrl_msgs.msg import CmdSetMotorPosition, SetMotorPosition, MotorStatusMsg
+from control_msgs.msg import JointTrajectoryControllerState
+from bodyctrl_msgs.msg import (
+    CmdSetMotorPosition,
+    MotorStatusMsg,
+    SetMotorPosition,
+)
 
-# ── YAML 解析 ──
 try:
     import yaml
 except ImportError:
     yaml = None
 
-# ── 查找包共享目录 ──
 try:
     from ament_index_python.packages import get_package_share_directory
 except ImportError:
@@ -31,10 +37,9 @@ except ImportError:
 
 
 # =============================================================================
-# 加载电机配置 (motor_config.yaml)
+# 加载电机配置
 # =============================================================================
-def _load_motor_config() -> tuple[dict[str, int], dict[int, float]]:
-    """加载 motor_config.yaml，返回 (joint_to_motor, motor_currents)。"""
+def _load_motor_config():
     paths = []
     if get_package_share_directory is not None:
         try:
@@ -52,29 +57,36 @@ def _load_motor_config() -> tuple[dict[str, int], dict[int, float]]:
                 with open(p, "r", encoding="utf-8") as f:
                     data = yaml.safe_load(f)
                 if isinstance(data, dict):
-                    j2m = {}
-                    raw_j2m = data.get("joint_to_motor", {})
-                    if isinstance(raw_j2m, dict):
-                        for k, v in raw_j2m.items():
-                            j2m[str(k)] = int(v)
-
-                    currents = {}
-                    raw_cur = data.get("motor_currents", {})
-                    if isinstance(raw_cur, dict):
-                        for k, v in raw_cur.items():
-                            currents[int(k)] = float(v)
-
-                    return j2m, currents
+                    j2m, cur, lim = {}, {}, {}
+                    for k, v in data.get("joint_to_motor", {}).items():
+                        j2m[str(k)] = int(v)
+                    for k, v in data.get("motor_currents", {}).items():
+                        cur[int(k)] = float(v)
+                    for k, v in data.get("motor_speed_limits", {}).items():
+                        lim[int(k)] = float(v)
+                    ratio = float(data.get("speed_ratio", 0.5))
+                    return j2m, cur, lim, ratio
             except Exception:
                 pass
-    return {}, {}
+    return {}, {}, {}, 0.5
 
-JOINT_TO_MOTOR, MOTOR_CURRENTS = _load_motor_config()
 
-# 到达判断容差 (rad)
-REACHED_TOLERANCE = 0.05
-# 控制循环频率 (Hz)
-CONTROL_HZ = 10
+JOINT_TO_MOTOR, MOTOR_CURRENTS, MOTOR_SPEED_LIMITS, SPEED_RATIO = _load_motor_config()
+
+CONTROL_HZ = 50.0
+REACHED_TOLERANCE = 0.05  # rad
+RPM_TO_RAD_S = 2.0 * math.pi / 60.0
+
+
+class Arm:
+    """单臂队列状态。queue: [(timestamp_sec, {motor_id: pos})] """
+
+    def __init__(self, side: str):
+        self.side = side
+        self.queue: list = []                       # [(float, dict[int,float])]
+        self.sent: dict[int, float] = {}            # 当前目标
+        self.speeds: dict[int, float] = {}          # 计算出的 spd (rad/s)
+        self.sent_time: float = 0.0                 # 当前目标的时间戳
 
 
 class BridgeNode(Node):
@@ -82,168 +94,158 @@ class BridgeNode(Node):
     def __init__(self):
         super().__init__("bridge_node")
 
-        # ── 发布：电机位置指令 ──
-        self._pub = self.create_publisher(
-            CmdSetMotorPosition, "/arm/cmd_pos", 10
-        )
+        self._l_arm = Arm("L")
+        self._r_arm = Arm("R")
 
-        # ── 订阅：move_group 规划轨迹 ──
-        self._traj_sub = self.create_subscription(
-            DisplayTrajectory, "/display_planned_path",
-            self._on_trajectory, 10,
-        )
-
-        # ── 订阅：机器人当前关节状态 ──
-        self._status_sub = self.create_subscription(
-            MotorStatusMsg, "/arm/status",
-            self._on_status, 10,
-        )
-
-        # ── 轨迹缓存 ──
-        self._waypoints: list[tuple[int, ...]] = []    # [(motor_id, pos), ...] per point
-        self._motor_ids: list[int] = []
-        self._current_wp_index = 0
-        self._side = "?"
-
-        # ── 状态缓存 ──
-        self._current_pos: dict[int, float] = {}       # motor_id → pos (rad)
+        self._motor_pos: dict[int, float] = {}
         self._lock = threading.Lock()
 
-        # ── 控制线程 ──
-        self._ctrl_thread = threading.Thread(target=self._control_loop, daemon=True)
-        self._ctrl_thread.start()
+        self._pub = self.create_publisher(CmdSetMotorPosition, "/arm/cmd_pos", 10)
+
+        self._create_ctrl_sub("/L_Arm_Group_controller/state", self._l_arm)
+        self._create_ctrl_sub("/R_Arm_Group_controller/state", self._r_arm)
+        self._status_sub = self.create_subscription(
+            MotorStatusMsg, "/arm/status", self._on_motor_status, 10
+        )
+        self.get_logger().info("  Subscribed: /arm/status")
+
+        period = 1.0 / CONTROL_HZ
+        self._timer = self.create_timer(period, self._tick)
 
         loaded = len(MOTOR_CURRENTS)
         if loaded > 0:
             self.get_logger().info(
-                f"Loaded motor currents for {loaded} motors: "
-                f"{dict(list(MOTOR_CURRENTS.items())[:3])}..."
+                f"Loaded config: {len(JOINT_TO_MOTOR)} joints → "
+                f"{loaded} motors, {len(MOTOR_SPEED_LIMITS)} speed limits, "
+                f"speed_ratio={SPEED_RATIO}"
             )
         else:
-            self.get_logger().warn(
-                "No motor_config.yaml found — using cur=0.0 for all motors"
-            )
+            self.get_logger().warn("No motor_config.yaml found")
 
         self.get_logger().info(
-            "Bridge ready: /display_planned_path → /arm/cmd_pos "
-            "(closed-loop, 10Hz, ±0.05rad)"
+            f"Bridge ready: L+R queues, {CONTROL_HZ:.0f}Hz, "
+            f"tolerance=±{REACHED_TOLERANCE}rad"
         )
 
     # =========================================================================
-    # 轨迹回调：替换待执行队列
+    # 控制器状态 → 入队 (时间戳 + 位置)
     # =========================================================================
-    def _on_trajectory(self, msg: DisplayTrajectory):
-        if not msg.trajectory:
-            return
-
-        jt = msg.trajectory[0].joint_trajectory
-        if not jt.points or not jt.joint_names:
-            return
-
-        # 过滤出已映射的关节
-        indices = []
-        motor_ids = []
-        for i, name in enumerate(jt.joint_names):
-            mid = JOINT_TO_MOTOR.get(name)
-            if mid is not None:
-                indices.append(i)
-                motor_ids.append(mid)
-
-        if not motor_ids:
-            return
-
-        side = "L" if "_l_" in jt.joint_names[0] else "R"
-        waypoints = []
-        for point in jt.points:
-            waypoints.append(
-                tuple(float(point.positions[idx]) for idx in indices)
-            )
-
-        with self._lock:
-            self._waypoints = waypoints
-            self._motor_ids = motor_ids
-            self._current_wp_index = 0
-            self._side = side
-
-        self.get_logger().info(
-            f"[{self._side}] New trajectory: {len(waypoints)} pts, "
-            f"{len(motor_ids)} motors"
-        )
-
-    # =========================================================================
-    # 状态回调
-    # =========================================================================
-    def _on_status(self, msg: MotorStatusMsg):
-        with self._lock:
-            for s in msg.status:
-                self._current_pos[s.name] = float(s.pos)
-
-    # =========================================================================
-    # 控制循环 (10 Hz)
-    # =========================================================================
-    def _control_loop(self):
-        rate = self.create_rate(CONTROL_HZ)
-        while rclpy.ok():
-            self._tick()
-            rate.sleep()
-
-    def _tick(self):
-        with self._lock:
-            wps = self._waypoints
-            mids = self._motor_ids
-            idx = self._current_wp_index
-            current_pos = dict(self._current_pos)
-
-        # 无待执行轨迹
-        if not wps or idx >= len(wps):
-            return
-
-        target = wps[idx]
-
-        # 检查当前路点是否已到达
-        if self._is_reached(target, mids, current_pos):
-            with self._lock:
-                if self._current_wp_index == idx:  # 未被新轨迹覆盖
-                    self._current_wp_index += 1
-
-            idx += 1
-            if idx >= len(wps):
-                self.get_logger().info(
-                    f"[{self._side}] Trajectory complete "
-                    f"({len(wps)} pts)"
-                )
+    def _create_ctrl_sub(self, topic: str, arm: Arm):
+        def callback(msg: JointTrajectoryControllerState):
+            if not msg.joint_names:
                 return
 
-            target = wps[idx]
+            now = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
 
-        # 发送当前路点
-        self._publish_waypoint(target, mids)
+            wp: dict[int, float] = {}
+            for name, pos in zip(msg.joint_names, msg.desired.positions):
+                mid = JOINT_TO_MOTOR.get(name)
+                if mid is not None:
+                    wp[mid] = float(pos)
+
+            if not wp:
+                return
+
+            with self._lock:
+                if arm.queue:
+                    _, last_wp = arm.queue[-1]
+                    if wp == last_wp:
+                        return
+                arm.queue.append((now, wp))
+
+        self.create_subscription(
+            JointTrajectoryControllerState, topic, callback, 10
+        )
+        self.get_logger().info(f"  Subscribed: {topic}")
+
+    # =========================================================================
+    # 电机实际状态
+    # =========================================================================
+    def _on_motor_status(self, msg: MotorStatusMsg):
+        with self._lock:
+            for s in msg.status:
+                self._motor_pos[int(s.name)] = float(s.pos)
+
+    # =========================================================================
+    # 主循环
+    # =========================================================================
+    def _tick(self):
+        changed = False
+
+        with self._lock:
+            pos = dict(self._motor_pos)
+
+            for arm in (self._l_arm, self._r_arm):
+                if not arm.queue:
+                    continue
+                t_now, wp = arm.queue[0]
+
+                if not arm.sent:
+                    arm.sent = wp
+                    arm.sent_time = t_now
+                    arm.speeds = {mid: 0.0 for mid in wp}
+                    arm.queue.pop(0)
+                    changed = True
+
+                elif self._reached(arm.sent, pos):
+                    dt = t_now - arm.sent_time
+                    self._compute_speeds(arm, wp, dt)
+                    arm.sent = wp
+                    arm.sent_time = t_now
+                    arm.queue.pop(0)
+                    changed = True
+
+            if changed:
+                self._publish_combined()
+
+    # =========================================================================
+    # 速度: spd = (wp - sent) / dt × ratio, 截断到限速
+    # =========================================================================
+    def _compute_speeds(self, arm: Arm, wp: dict[int, float], dt: float):
+        arm.speeds.clear()
+        if dt < 1e-6:
+            dt = 0.02
+
+        for mid, new_pos in wp.items():
+            old_pos = arm.sent.get(mid, new_pos)
+            dp = new_pos - old_pos
+            spd = (dp / dt) * SPEED_RATIO
+
+            limit_rpm = MOTOR_SPEED_LIMITS.get(mid, 0.0)
+            if limit_rpm > 0:
+                limit_rad_s = limit_rpm * RPM_TO_RAD_S
+                spd = max(-limit_rad_s, min(limit_rad_s, spd))
+
+            arm.speeds[mid] = spd
 
     # =========================================================================
     # 到达判断
     # =========================================================================
-    def _is_reached(self, target, motor_ids, current_pos):
-        for motor_id, tgt in zip(motor_ids, target):
-            cur = current_pos.get(motor_id)
+    def _reached(self, targets: dict[int, float], current: dict[int, float]) -> bool:
+        for mid, tgt in targets.items():
+            cur = current.get(mid)
             if cur is None:
-                return False  # 还没收到该关节状态
+                return False
             if abs(cur - tgt) > REACHED_TOLERANCE:
                 return False
         return True
 
     # =========================================================================
-    # 发送单路点
+    # 合并双臂 → /arm/cmd_pos
     # =========================================================================
-    def _publish_waypoint(self, target, motor_ids):
+    def _publish_combined(self):
         cmd = CmdSetMotorPosition()
         cmd.header.stamp = self.get_clock().now().to_msg()
 
-        for motor_id, pos in zip(motor_ids, target):
+        for mid in sorted(JOINT_TO_MOTOR.values()):
+            pos = self._l_arm.sent.get(mid) or self._r_arm.sent.get(mid)
+            if pos is None:
+                continue
             sp = SetMotorPosition()
-            sp.name = motor_id
+            sp.name = mid
             sp.pos = pos
-            sp.spd = 0.0
-            sp.cur = MOTOR_CURRENTS.get(motor_id, 0.0)
+            sp.spd = self._l_arm.speeds.get(mid, self._r_arm.speeds.get(mid, 0.0))
+            sp.cur = MOTOR_CURRENTS.get(mid, 0.0)
             cmd.cmds.append(sp)
 
         self._pub.publish(cmd)
@@ -252,8 +254,12 @@ class BridgeNode(Node):
 def main():
     rclpy.init()
     node = BridgeNode()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
